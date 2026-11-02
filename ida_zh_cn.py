@@ -27,6 +27,13 @@ Shiboken = None
 
 _RE_LOAD_FILE_AS = re.compile(r"^Load file\s+(.+?)\s+as:?$", re.IGNORECASE)
 _RE_LINE_OF = re.compile(r"^Line\s+(\d+)\s+of\s+(\d+)(.*)$", re.IGNORECASE)
+_RE_DISK_SPACE = re.compile(r"^Disk:\s*(.+)$", re.IGNORECASE)
+_RE_AU_STATE = re.compile(r"^AU:\s*(.+)$", re.IGNORECASE)
+_RE_NAV_SCALE = re.compile(
+    r"^Navigator Scale:\s*(\d+)\s*pixel\s*=\s*(\d+)\s*bytes?;\s*Range:\s*(.+)$",
+    re.IGNORECASE,
+)
+_RE_SYNC_WITH = re.compile(r"^\(Synchronized with\s+(.+)\)$", re.IGNORECASE)
 _RE_SELECT_FONT = re.compile(r"^Select font for:\s*(.+)$", re.IGNORECASE)
 _RE_SEGMENTS_VISIBLE = re.compile(r"^Segments visible from\s+(.+)$", re.IGNORECASE)
 _RE_NEW_VALUE_OF = re.compile(r"^New value of\s+(.+)$", re.IGNORECASE)
@@ -209,18 +216,22 @@ def _create_signal_receiver(manager):
             self.schedule_ui_refresh(20)
 
         @_safe_call
+        def on_statusbar_message_changed(self, msg=""):
+            if not self._mgr or not self._mgr.initialized or not self._mgr.enabled:
+                return
+            sb = self.sender()
+            if _is_valid_qobj(sb) and isinstance(sb, QtWidgets.QStatusBar):
+                self._mgr._translate_statusbar(sb, msg)
+
+        @_safe_call
         def on_tab_current_changed(self, _idx=0):
             if not self._mgr or not self._mgr.initialized:
                 return
             tabw = self.sender()
-            if _is_valid_qobj(tabw):
-                if isinstance(tabw, QtWidgets.QTabBar):
-                    self._mgr._translate_single_tabbar(tabw)
-                elif isinstance(tabw, QtWidgets.QWidget):
-                    win = tabw.window()
-                    if _is_valid_qobj(win):
-                        self._mgr._translate_dialog(win)
-                        self.schedule_ui_refresh(20)
+            if _is_valid_qobj(tabw) and isinstance(tabw, QtWidgets.QTabBar):
+                self._mgr._translate_single_tabbar(tabw)
+            self._mgr._translate_active_dialogs()
+            self.schedule_ui_refresh(20)
 
     return _QtSignalReceiver(manager)
 
@@ -941,9 +952,6 @@ class IdaZhLocalizationManager:
         if _is_valid_qobj(popup) and isinstance(popup, QtWidgets.QMenu):
             if not popup.property("_ida_zh_is_top"):
                 self._translate_popup_menu_once(popup)
-        modal = app.activeModalWidget()
-        if _is_valid_qobj(modal):
-            self._translate_dialog(modal)
         for top in list(app.topLevelWidgets()):
             if not _is_valid_qobj(top) or not top.isVisible():
                 continue
@@ -958,13 +966,7 @@ class IdaZhLocalizationManager:
     def _on_focus_changed(self, old_widget, new_widget):
         if not self.initialized or not self.enabled:
             return
-        if _is_valid_qobj(new_widget):
-            win = new_widget.window()
-            if _is_valid_qobj(win):
-                if isinstance(win, QtWidgets.QMainWindow):
-                    self._translate_dialog(win, is_mainwindow=True)
-                elif not isinstance(win, QtWidgets.QMenu):
-                    self._translate_dialog(win)
+        self._translate_active_dialogs()
         self._translate_toolbars_and_docks()
         self._translate_all_tabbars()
         if self._receiver is not None:
@@ -1098,6 +1100,27 @@ class IdaZhLocalizationManager:
                     except Exception:
                         pass
 
+            elif isinstance(child, QtWidgets.QStatusBar):
+                self._translate_statusbar(child)
+                if self._receiver is not None and not child.property("_ida_zh_sb_hooked"):
+                    child.setProperty("_ida_zh_sb_hooked", True)
+                    try:
+                        child.messageChanged.connect(self._receiver.on_statusbar_message_changed)
+                    except Exception:
+                        pass
+
+    @_safe_call
+    def _translate_statusbar(self, sb, msg=None):
+        if not self.enabled or not _is_valid_qobj(sb):
+            return
+        cur = msg if msg is not None else (sb.currentMessage() or "")
+        if not cur or _has_cjk(cur):
+            return
+        zh = self._lookup_dialog_string(cur)
+        if zh and zh != cur:
+            sb.setProperty("_ida_zh_orig_msg", cur)
+            sb.showMessage(zh)
+
     @_safe_call
     def _restore_dialog(self, dlg):
         if not _is_valid_qobj(dlg):
@@ -1142,6 +1165,10 @@ class IdaZhLocalizationManager:
                     orig_tab = child.property(f"_ida_zh_orig_tab_{i}")
                     if orig_tab:
                         child.setTabText(i, str(orig_tab))
+            elif isinstance(child, QtWidgets.QStatusBar):
+                orig_msg = child.property("_ida_zh_orig_msg")
+                if orig_msg:
+                    child.showMessage(str(orig_msg))
 
     def _lookup_dialog_string(self, text):
         if not text:
@@ -1155,12 +1182,20 @@ class IdaZhLocalizationManager:
         clean = _strip_accel(raw)
         if clean in self.dialog_text:
             return self.dialog_text[clean]
+        if clean in self.tab_titles:
+            return self.tab_titles[clean]
 
         clean_lower = clean.lower()
         if clean_lower in self.dialog_text_lower:
             return self.dialog_text_lower[clean_lower]
         if clean_lower in self.qt_translate_clean:
             return self.qt_translate_clean[clean_lower]
+        if clean_lower in self.tab_titles_lower:
+            return self.tab_titles_lower[clean_lower]
+
+        for en_prefix, zh_prefix in self.tab_prefixes:
+            if clean.startswith(en_prefix):
+                return zh_prefix + clean[len(en_prefix):]
 
         if "\n" in raw:
             lines = raw.splitlines()
@@ -1193,9 +1228,32 @@ class IdaZhLocalizationManager:
                 suffix = suffix[:-11] + " (已过期)"
             return f"第 {m_line.group(1)} / {m_line.group(2)} 行{suffix}"
 
+        m_disk = _RE_DISK_SPACE.match(clean)
+        if m_disk:
+            return f"磁盘可用: {m_disk.group(1)}"
+
+        m_au = _RE_AU_STATE.match(clean)
+        if m_au:
+            st = m_au.group(1).strip()
+            if st.lower() == "idle":
+                return "自动分析: 空闲"
+            return f"自动分析: {st}"
+
+        m_nav = _RE_NAV_SCALE.match(clean)
+        if m_nav:
+            return f"导航栏比例: {m_nav.group(1)} 像素 = {m_nav.group(2)} 字节; 范围: {m_nav.group(3)}"
+
+        m_sync = _RE_SYNC_WITH.match(clean)
+        if m_sync:
+            target = m_sync.group(1).strip()
+            zh_target = self._lookup_dialog_string(target) or target
+            return f"(已与 {zh_target} 同步)"
+
         m_font = _RE_SELECT_FONT.match(clean)
         if m_font:
-            return f"选择字体: {m_font.group(1)}"
+            target = m_font.group(1).strip()
+            zh_target = self._lookup_dialog_string(target) or target
+            return f"选择字体: {zh_target}"
 
         m_seg = _RE_SEGMENTS_VISIBLE.match(clean)
         if m_seg:
