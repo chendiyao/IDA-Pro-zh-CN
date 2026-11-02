@@ -25,6 +25,15 @@ QtGui = None
 QtWidgets = None
 Shiboken = None
 
+_RE_LOAD_FILE_AS = re.compile(r"^Load file\s+(.+?)\s+as:?$", re.IGNORECASE)
+_RE_LINE_OF = re.compile(r"^Line\s+(\d+)\s+of\s+(\d+)(.*)$", re.IGNORECASE)
+_RE_SELECT_FONT = re.compile(r"^Select font for:\s*(.+)$", re.IGNORECASE)
+_RE_SEGMENTS_VISIBLE = re.compile(r"^Segments visible from\s+(.+)$", re.IGNORECASE)
+_RE_NEW_VALUE_OF = re.compile(r"^New value of\s+(.+)$", re.IGNORECASE)
+_RE_EDIT_EXT_ASSOC = re.compile(r"^Edit file extension\s+'(.+?)'\s+association$", re.IGNORECASE)
+_RE_CONVERT_EN_MASSE = re.compile(r'^Convert to\s+"(.+?)"\s+en masse$', re.IGNORECASE)
+_RE_CHUNK_START = re.compile(r"^Chunk\s+(\d+)\s+Start$", re.IGNORECASE)
+
 
 def _safe_call(func):
     @functools.wraps(func)
@@ -48,9 +57,11 @@ def _has_cjk(text):
 def _strip_accel(text):
     if not text:
         return ""
-    s = re.sub(r"~([A-Za-z0-9])~", r"\1", text)
+    s = text.replace("&&", "\x00")
+    s = re.sub(r"~([A-Za-z0-9])~", r"\1", s)
     s = re.sub(r"\(&+[A-Za-z0-9]\)", "", s)
-    return s.replace("&", "").strip()
+    s = re.sub(r"&(?=\S)", "", s)
+    return s.replace("\x00", "&").strip()
 
 
 def _strip_bilingual_suffix(text):
@@ -150,23 +161,31 @@ def _create_signal_receiver(manager):
             self._timer = QtCore.QTimer(self)
             self._timer.setSingleShot(True)
             self._timer.timeout.connect(self.on_deferred_ui_refresh)
+            self._timer_followup = QtCore.QTimer(self)
+            self._timer_followup.setSingleShot(True)
+            self._timer_followup.timeout.connect(self.on_deferred_ui_refresh)
 
         @_safe_call
-        def schedule_ui_refresh(self, delay_ms=50):
+        def schedule_ui_refresh(self, delay_ms=30):
             if not self._mgr or not self._mgr.initialized:
                 return
             if self._timer is not None and _is_valid_qobj(self._timer):
                 self._timer.start(delay_ms)
+            if self._timer_followup is not None and _is_valid_qobj(self._timer_followup):
+                self._timer_followup.start(max(delay_ms + 100, 140))
 
         @_safe_call
         def stop_timer(self):
             if self._timer is not None and _is_valid_qobj(self._timer):
                 self._timer.stop()
+            if self._timer_followup is not None and _is_valid_qobj(self._timer_followup):
+                self._timer_followup.stop()
 
         @_safe_call
         def on_deferred_ui_refresh(self):
             if not self._mgr or not self._mgr.initialized or not self._mgr.enabled:
                 return
+            self._mgr._translate_toolbars_and_docks()
             self._mgr._translate_all_tabbars()
             self._mgr._translate_active_dialogs()
 
@@ -175,6 +194,19 @@ def _create_signal_receiver(manager):
             if not self._mgr or not self._mgr.initialized:
                 return
             self._mgr._on_focus_changed(old_widget, new_widget)
+
+        @_safe_call
+        def on_focus_window_changed(self, _focus_window=None):
+            if not self._mgr or not self._mgr.initialized or not self._mgr.enabled:
+                return
+            self._mgr._translate_active_dialogs()
+            self.schedule_ui_refresh(25)
+
+        @_safe_call
+        def on_dialog_interaction(self, *_args):
+            if not self._mgr or not self._mgr.initialized or not self._mgr.enabled:
+                return
+            self.schedule_ui_refresh(20)
 
         @_safe_call
         def on_tab_current_changed(self, _idx=0):
@@ -186,7 +218,7 @@ def _create_signal_receiver(manager):
                     self._mgr._translate_single_tabbar(tabw)
                 elif isinstance(tabw, QtWidgets.QWidget):
                     win = tabw.window()
-                    if _is_valid_qobj(win) and isinstance(win, QtWidgets.QDialog):
+                    if _is_valid_qobj(win):
                         self._mgr._translate_dialog(win)
                         self.schedule_ui_refresh(20)
 
@@ -234,6 +266,17 @@ class IdaZhUIHooks(ida_kernwin.UI_Hooks):
             self._mgr.on_widget_event()
 
     @_safe_call
+    def preprocess_action(self, name):
+        if self._mgr:
+            self._mgr.on_action_event()
+        return 0
+
+    @_safe_call
+    def postprocess_action(self):
+        if self._mgr:
+            self._mgr.on_action_event()
+
+    @_safe_call
     def finish_populating_widget_popup(self, widget, popup_handle, ctx=None):
         if self._mgr:
             self._mgr.on_popup_ready()
@@ -275,6 +318,38 @@ class IdaZhLocalizationManager:
         "OpOffset": "~O~ffset 偏移量",
         "OpNumber": "~N~umber 数值格式",
     }
+
+    _TOOLBAR_TITLES = {
+        "Navigator": "导航栏",
+        "Navigation dock": "导航停靠栏",
+        "File": "文件",
+        "Jump": "跳转",
+        "Search": "搜索",
+        "Hide/Unhide": "隐藏/取消隐藏",
+        "Analysis": "分析",
+        "Views": "视图",
+        "Graph view": "图形视图",
+        "Lists": "列表",
+        "Signatures/Types": "签名/类型",
+        "Types": "类型",
+        "Cross references": "交叉引用",
+        "Segments": "段",
+        "Edit": "编辑",
+        "Operand type": "操作数类型",
+        "Utilities": "实用工具",
+        "Functions": "函数",
+        "Local Types": "本地类型",
+        "Comments": "注释",
+        "Debug": "调试",
+        "Debugger commands": "调试器命令",
+        "Breakpoints": "断点",
+        "Watches": "监视",
+        "Tracing": "追踪",
+        "Merge": "合并",
+        "Diff": "差异对比",
+    }
+
+    _SAFE_COMBOBOX_NAMES = ("DebuggerList", "comboBkgColor", "comboColor")
 
     def __init__(self):
         self.dict_path = _resolve_dict_path()
@@ -395,6 +470,10 @@ class IdaZhLocalizationManager:
                     app.focusChanged.connect(self._receiver.on_focus_changed)
                 except Exception:
                     pass
+                try:
+                    app.focusWindowChanged.connect(self._receiver.on_focus_window_changed)
+                except Exception:
+                    pass
 
         if self._ui_hooks is None:
             self._ui_hooks = IdaZhUIHooks(self)
@@ -430,6 +509,10 @@ class IdaZhLocalizationManager:
                     if app is not None:
                         try:
                             app.focusChanged.disconnect(self._receiver.on_focus_changed)
+                        except Exception:
+                            pass
+                        try:
+                            app.focusWindowChanged.disconnect(self._receiver.on_focus_window_changed)
                         except Exception:
                             pass
                 if Shiboken is not None and Shiboken.isValid(self._receiver):
@@ -492,11 +575,12 @@ class IdaZhLocalizationManager:
         if not self.initialized or not self.enabled or not _ensure_qt():
             return
         self._translate_registered_actions()
+        self._translate_toolbars_and_docks()
         self._translate_all_menus()
         self._translate_all_tabbars()
         self._translate_active_dialogs()
         if self._receiver is not None:
-            self._receiver.schedule_ui_refresh(50)
+            self._receiver.schedule_ui_refresh(30)
 
     @_safe_call
     def restore_english(self):
@@ -534,9 +618,21 @@ class IdaZhLocalizationManager:
                             orig_txt = act.property("_ida_zh_orig_text")
                             if orig_txt:
                                 act.setText(str(orig_txt))
+                elif isinstance(w, (QtWidgets.QToolBar, QtWidgets.QDockWidget)):
+                    orig_title = w.property("_ida_zh_orig_title")
+                    if orig_title:
+                        w.setWindowTitle(str(orig_title))
+                    toggle_act = w.toggleViewAction()
+                    if _is_valid_qobj(toggle_act):
+                        orig_act_txt = toggle_act.property("_ida_zh_orig_text")
+                        if orig_act_txt:
+                            toggle_act.setText(str(orig_act_txt))
+                elif isinstance(w, QtWidgets.QComboBox):
+                    if (w.objectName() or "") in self._SAFE_COMBOBOX_NAMES:
+                        self._restore_combobox_items(w)
                 elif isinstance(w, QtWidgets.QTabBar):
                     self._restore_tabbar(w)
-                elif isinstance(w, QtWidgets.QDialog):
+                elif isinstance(w, (QtWidgets.QDialog, QtWidgets.QMainWindow)):
                     self._restore_dialog(w)
 
     @_safe_call
@@ -563,6 +659,58 @@ class IdaZhLocalizationManager:
                     ida_kernwin.update_action_tooltip(act_name, zh_tip)
             except Exception:
                 continue
+
+    @_safe_call
+    def _translate_toolbars_and_docks(self):
+        if not self.enabled or not _ensure_qt():
+            return
+        app = QtWidgets.QApplication.instance()
+        if app is None:
+            return
+        for w in list(app.allWidgets()):
+            if not _is_valid_qobj(w):
+                continue
+            if isinstance(w, (QtWidgets.QToolBar, QtWidgets.QDockWidget)):
+                title = w.windowTitle() or ""
+                clean_title = _strip_accel(title)
+                zh = self._TOOLBAR_TITLES.get(clean_title) or self.tab_titles.get(clean_title)
+                if zh and not _has_cjk(title):
+                    w.setProperty("_ida_zh_orig_title", title)
+                    w.setWindowTitle(zh)
+                toggle_act = w.toggleViewAction()
+                if _is_valid_qobj(toggle_act):
+                    act_txt = toggle_act.text() or ""
+                    clean_act = _strip_accel(act_txt)
+                    zh_act = zh or self._TOOLBAR_TITLES.get(clean_act) or self.tab_titles.get(clean_act)
+                    if zh_act and act_txt and not _has_cjk(act_txt):
+                        toggle_act.setProperty("_ida_zh_orig_text", act_txt)
+                        toggle_act.setText(zh_act)
+            elif isinstance(w, QtWidgets.QComboBox):
+                if (w.objectName() or "") in self._SAFE_COMBOBOX_NAMES:
+                    self._translate_combobox_items(w)
+
+    @_safe_call
+    def _translate_combobox_items(self, cb):
+        if not _is_valid_qobj(cb):
+            return
+        count = cb.count()
+        for i in range(count):
+            it_txt = cb.itemText(i) or ""
+            if it_txt and not _has_cjk(it_txt):
+                zh_it = self._lookup_dialog_string(it_txt)
+                if zh_it and zh_it != it_txt:
+                    cb.setProperty(f"_ida_zh_orig_item_{i}", it_txt)
+                    cb.setItemText(i, zh_it)
+
+    @_safe_call
+    def _restore_combobox_items(self, cb):
+        if not _is_valid_qobj(cb):
+            return
+        count = cb.count()
+        for i in range(count):
+            orig_it = cb.property(f"_ida_zh_orig_item_{i}")
+            if orig_it:
+                cb.setItemText(i, str(orig_it))
 
     @_safe_call
     def _translate_all_menus(self):
@@ -639,17 +787,27 @@ class IdaZhLocalizationManager:
                     if zh_sub and qmenu.title() != zh_sub:
                         qmenu.setTitle(zh_sub)
 
+        is_toolbar_menu = clean_orig in ("toolbars", "toolbar")
         for act in qmenu.actions():
             if not _is_valid_qobj(act) or act.isSeparator():
                 continue
             sub = act.menu()
             if _is_valid_qobj(sub) and sub is not qmenu:
                 self._setup_static_menu(sub, is_top_level=False)
+            elif is_toolbar_menu and self.enabled:
+                txt = act.text() or ""
+                if txt and not _has_cjk(txt):
+                    clean_act = _strip_accel(txt)
+                    zh_act = self._TOOLBAR_TITLES.get(clean_act)
+                    if zh_act:
+                        act.setProperty("_ida_zh_orig_text", txt)
+                        act.setText(zh_act)
 
     @_safe_call
     def on_popup_ready(self):
         if not self.initialized or not self.enabled or not _ensure_qt():
             return
+        self._translate_toolbars_and_docks()
         app = QtWidgets.QApplication.instance()
         if app is None:
             return
@@ -683,7 +841,8 @@ class IdaZhLocalizationManager:
             clean_lower = clean_main.lower()
 
             zh_txt = (
-                self.action_text_to_zh.get(main_txt)
+                self._TOOLBAR_TITLES.get(clean_main)
+                or self.action_text_to_zh.get(main_txt)
                 or self.action_text_to_zh.get(clean_main)
                 or self.action_text_to_zh_lower.get(clean_lower)
             )
@@ -755,13 +914,21 @@ class IdaZhLocalizationManager:
                     break
 
     @_safe_call
+    def on_action_event(self):
+        if not self.initialized or not self.enabled or not _ensure_qt():
+            return
+        if self._receiver is not None:
+            self._receiver.schedule_ui_refresh(25)
+
+    @_safe_call
     def on_widget_event(self):
         if not self.initialized or not self.enabled or not _ensure_qt():
             return
+        self._translate_toolbars_and_docks()
         self._translate_all_tabbars()
         self._translate_active_dialogs()
         if self._receiver is not None:
-            self._receiver.schedule_ui_refresh(50)
+            self._receiver.schedule_ui_refresh(30)
 
     @_safe_call
     def _translate_active_dialogs(self):
@@ -770,11 +937,21 @@ class IdaZhLocalizationManager:
         app = QtWidgets.QApplication.instance()
         if app is None:
             return
+        popup = app.activePopupWidget()
+        if _is_valid_qobj(popup) and isinstance(popup, QtWidgets.QMenu):
+            if not popup.property("_ida_zh_is_top"):
+                self._translate_popup_menu_once(popup)
         modal = app.activeModalWidget()
-        if _is_valid_qobj(modal) and isinstance(modal, QtWidgets.QDialog):
+        if _is_valid_qobj(modal):
             self._translate_dialog(modal)
         for top in list(app.topLevelWidgets()):
-            if _is_valid_qobj(top) and isinstance(top, QtWidgets.QDialog) and top.isVisible():
+            if not _is_valid_qobj(top) or not top.isVisible():
+                continue
+            if isinstance(top, QtWidgets.QDialog):
+                self._translate_dialog(top)
+            elif isinstance(top, QtWidgets.QMainWindow):
+                self._translate_dialog(top, is_mainwindow=True)
+            elif isinstance(top, QtWidgets.QWidget) and not isinstance(top, QtWidgets.QMenu):
                 self._translate_dialog(top)
 
     @_safe_call
@@ -783,21 +960,28 @@ class IdaZhLocalizationManager:
             return
         if _is_valid_qobj(new_widget):
             win = new_widget.window()
-            if _is_valid_qobj(win) and isinstance(win, QtWidgets.QDialog):
-                self._translate_dialog(win)
+            if _is_valid_qobj(win):
+                if isinstance(win, QtWidgets.QMainWindow):
+                    self._translate_dialog(win, is_mainwindow=True)
+                elif not isinstance(win, QtWidgets.QMenu):
+                    self._translate_dialog(win)
+        self._translate_toolbars_and_docks()
         self._translate_all_tabbars()
+        if self._receiver is not None:
+            self._receiver.schedule_ui_refresh(25)
 
     @_safe_call
-    def _translate_dialog(self, dlg):
+    def _translate_dialog(self, dlg, is_mainwindow=False):
         if not self.enabled or not _is_valid_qobj(dlg):
             return
 
-        title = dlg.windowTitle() or ""
-        if title and not _has_cjk(title):
-            zh_title = self._lookup_dialog_string(title)
-            if zh_title and zh_title != title:
-                dlg.setProperty("_ida_zh_orig_title", title)
-                dlg.setWindowTitle(zh_title)
+        if not is_mainwindow:
+            title = dlg.windowTitle() or ""
+            if title and not _has_cjk(title):
+                zh_title = self._lookup_dialog_string(title)
+                if zh_title and zh_title != title:
+                    dlg.setProperty("_ida_zh_orig_title", title)
+                    dlg.setWindowTitle(zh_title)
 
         for child in dlg.findChildren(QtWidgets.QWidget):
             if not _is_valid_qobj(child):
@@ -812,20 +996,21 @@ class IdaZhLocalizationManager:
                     QtWidgets.QToolButton,
                 ),
             ):
+                if is_mainwindow and isinstance(child, QtWidgets.QToolButton):
+                    continue
                 txt = child.text() or ""
                 if txt and not _has_cjk(txt):
                     zh = self._lookup_dialog_string(txt)
                     if zh and zh != txt:
                         child.setProperty("_ida_zh_orig_text", txt)
                         child.setText(zh)
-                if (
-                    isinstance(child, (QtWidgets.QCheckBox, QtWidgets.QRadioButton))
-                    and self._receiver is not None
-                    and not child.property("_ida_zh_btn_hooked")
-                ):
+                if self._receiver is not None and not child.property("_ida_zh_btn_hooked"):
                     child.setProperty("_ida_zh_btn_hooked", True)
                     try:
-                        child.toggled.connect(self._receiver.on_tab_current_changed)
+                        if isinstance(child, (QtWidgets.QCheckBox, QtWidgets.QRadioButton)):
+                            child.toggled.connect(self._receiver.on_tab_current_changed)
+                        else:
+                            child.clicked.connect(self._receiver.on_dialog_interaction)
                     except Exception:
                         pass
 
@@ -839,7 +1024,7 @@ class IdaZhLocalizationManager:
 
             elif isinstance(child, QtWidgets.QLabel):
                 lbl_txt = child.text() or ""
-                if lbl_txt and not _has_cjk(lbl_txt) and len(lbl_txt) < 300:
+                if lbl_txt and not _has_cjk(lbl_txt) and len(lbl_txt) < 400:
                     if lbl_txt in self.qt_translate:
                         child.setProperty("_ida_zh_orig_text", lbl_txt)
                         child.setText(self.qt_translate[lbl_txt])
@@ -849,14 +1034,61 @@ class IdaZhLocalizationManager:
                             child.setProperty("_ida_zh_orig_text", lbl_txt)
                             child.setText(zh)
 
+            elif isinstance(child, QtWidgets.QComboBox):
+                if (child.objectName() or "") in self._SAFE_COMBOBOX_NAMES:
+                    self._translate_combobox_items(child)
+
+            elif isinstance(child, QtWidgets.QListWidget):
+                if (child.objectName() or "") == "nats":
+                    for i in range(child.count()):
+                        item = child.item(i)
+                        if item is not None:
+                            it_txt = item.text() or ""
+                            if it_txt and not _has_cjk(it_txt):
+                                zh_it = self._lookup_dialog_string(it_txt)
+                                if zh_it and zh_it != it_txt:
+                                    item.setData(QtCore.Qt.UserRole + 999, it_txt)
+                                    item.setText(zh_it)
+
+            elif isinstance(child, QtWidgets.QAbstractItemView):
+                if not is_mainwindow and self._receiver is not None and not child.property("_ida_zh_sel_hooked"):
+                    sel_model = child.selectionModel()
+                    if _is_valid_qobj(sel_model):
+                        child.setProperty("_ida_zh_sel_hooked", True)
+                        try:
+                            sel_model.selectionChanged.connect(self._receiver.on_dialog_interaction)
+                        except Exception:
+                            pass
+                if not is_mainwindow and isinstance(child, QtWidgets.QTableWidget):
+                    for col in range(child.columnCount()):
+                        hdr_item = child.horizontalHeaderItem(col)
+                        if hdr_item is not None:
+                            h_txt = hdr_item.text() or ""
+                            if h_txt and not _has_cjk(h_txt):
+                                zh_h = self._lookup_dialog_string(h_txt)
+                                if zh_h and zh_h != h_txt:
+                                    hdr_item.setData(QtCore.Qt.UserRole + 999, h_txt)
+                                    hdr_item.setText(zh_h)
+                elif not is_mainwindow and isinstance(child, QtWidgets.QTreeWidget):
+                    hdr_item = child.headerItem()
+                    if hdr_item is not None:
+                        for col in range(child.columnCount()):
+                            h_txt = hdr_item.text(col) or ""
+                            if h_txt and not _has_cjk(h_txt):
+                                zh_h = self._lookup_dialog_string(h_txt)
+                                if zh_h and zh_h != h_txt:
+                                    hdr_item.setData(col, QtCore.Qt.UserRole + 999, h_txt)
+                                    hdr_item.setText(col, zh_h)
+
             elif isinstance(child, QtWidgets.QTabBar):
-                for i in range(child.count()):
-                    t_txt = child.tabText(i) or ""
-                    if t_txt and not _has_cjk(t_txt):
-                        zh = self._lookup_dialog_string(t_txt)
-                        if zh and zh != t_txt:
-                            child.setProperty(f"_ida_zh_orig_tab_{i}", t_txt)
-                            child.setTabText(i, zh)
+                if not is_mainwindow:
+                    for i in range(child.count()):
+                        t_txt = child.tabText(i) or ""
+                        if t_txt and not _has_cjk(t_txt):
+                            zh = self._lookup_dialog_string(t_txt)
+                            if zh and zh != t_txt:
+                                child.setProperty(f"_ida_zh_orig_tab_{i}", t_txt)
+                                child.setTabText(i, zh)
 
             elif isinstance(child, QtWidgets.QTabWidget):
                 if self._receiver is not None and not child.property("_ida_zh_tab_hooked"):
@@ -870,9 +1102,10 @@ class IdaZhLocalizationManager:
     def _restore_dialog(self, dlg):
         if not _is_valid_qobj(dlg):
             return
-        orig_title = dlg.property("_ida_zh_orig_title")
-        if orig_title:
-            dlg.setWindowTitle(str(orig_title))
+        if not isinstance(dlg, QtWidgets.QMainWindow):
+            orig_title = dlg.property("_ida_zh_orig_title")
+            if orig_title:
+                dlg.setWindowTitle(str(orig_title))
         for child in dlg.findChildren(QtWidgets.QWidget):
             if not _is_valid_qobj(child):
                 continue
@@ -893,6 +1126,17 @@ class IdaZhLocalizationManager:
                 orig_gb = child.property("_ida_zh_orig_title")
                 if orig_gb:
                     child.setTitle(str(orig_gb))
+            elif isinstance(child, QtWidgets.QComboBox):
+                if (child.objectName() or "") in self._SAFE_COMBOBOX_NAMES:
+                    self._restore_combobox_items(child)
+            elif isinstance(child, QtWidgets.QListWidget):
+                if (child.objectName() or "") == "nats":
+                    for i in range(child.count()):
+                        item = child.item(i)
+                        if item is not None:
+                            orig_it = item.data(QtCore.Qt.UserRole + 999)
+                            if orig_it:
+                                item.setText(str(orig_it))
             elif isinstance(child, QtWidgets.QTabBar):
                 for i in range(child.count()):
                     orig_tab = child.property(f"_ida_zh_orig_tab_{i}")
@@ -918,10 +1162,66 @@ class IdaZhLocalizationManager:
         if clean_lower in self.qt_translate_clean:
             return self.qt_translate_clean[clean_lower]
 
+        if "\n" in raw:
+            lines = raw.splitlines()
+            translated_lines = []
+            any_changed = False
+            for ln in lines:
+                s_ln = ln.strip()
+                if not s_ln:
+                    translated_lines.append(ln)
+                    continue
+                zh_ln = self._lookup_dialog_string(s_ln)
+                if zh_ln and zh_ln != s_ln:
+                    translated_lines.append(zh_ln)
+                    any_changed = True
+                else:
+                    translated_lines.append(ln)
+            if any_changed:
+                return "\n".join(translated_lines)
+
+        m_load = _RE_LOAD_FILE_AS.match(clean)
+        if m_load:
+            return f"加载文件 {m_load.group(1)} 为"
+
+        m_line = _RE_LINE_OF.match(clean)
+        if m_line:
+            suffix = m_line.group(3) or ""
+            if suffix == ", (outdated)":
+                suffix = " (已过期)"
+            elif suffix.endswith(" (outdated)"):
+                suffix = suffix[:-11] + " (已过期)"
+            return f"第 {m_line.group(1)} / {m_line.group(2)} 行{suffix}"
+
+        m_font = _RE_SELECT_FONT.match(clean)
+        if m_font:
+            return f"选择字体: {m_font.group(1)}"
+
+        m_seg = _RE_SEGMENTS_VISIBLE.match(clean)
+        if m_seg:
+            return f"从 {m_seg.group(1)} 可见的段"
+
+        m_val = _RE_NEW_VALUE_OF.match(clean)
+        if m_val:
+            return f"{m_val.group(1)} 的新值"
+
+        m_ext = _RE_EDIT_EXT_ASSOC.match(clean)
+        if m_ext:
+            return f"编辑文件扩展名 '{m_ext.group(1)}' 关联"
+
+        m_conv = _RE_CONVERT_EN_MASSE.match(clean)
+        if m_conv:
+            return f'批量转换为 "{m_conv.group(1)}"'
+
+        m_chunk = _RE_CHUNK_START.match(clean)
+        if m_chunk:
+            return f"分块 {m_chunk.group(1)} 起始地址"
+
         for en_suf, zh_suf in (
             (" (non-graph)", " (非图形)"),
             (" (graph)", " (图形)"),
             (" (default)", " (默认)"),
+            (" (highlighted)", " (高亮)"),
         ):
             if clean_lower.endswith(en_suf):
                 base = clean_lower[: -len(en_suf)].strip()
@@ -934,6 +1234,8 @@ class IdaZhLocalizationManager:
             ("Example: ", "示例: "),
             ("Supported languages: ", "支持的语言: "),
             ("Current processor: ", "当前处理器: "),
+            ("Debug application setup: ", "调试应用程序设置: "),
+            ("Xref Graph: ", "交叉引用图: "),
         ):
             if clean.startswith(en_pref):
                 return zh_pref + clean[len(en_pref) :]
@@ -942,7 +1244,7 @@ class IdaZhLocalizationManager:
             base = clean_lower[:-1].strip()
             zh_base = self.dialog_text_lower.get(base) or self.qt_translate_clean.get(base)
             if zh_base:
-                return _strip_accel(zh_base).rstrip(":") + ":"
+                return _strip_accel(zh_base).rstrip(":：") + ":"
         if clean_lower.endswith("..."):
             base = clean_lower[:-3].strip()
             zh_base = self.dialog_text_lower.get(base) or self.qt_translate_clean.get(base)
