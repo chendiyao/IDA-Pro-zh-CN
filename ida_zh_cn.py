@@ -215,6 +215,25 @@ def _alive(obj):
     return True
 
 
+def _inside_assist(widget):
+    if not _init_qt():
+        return False
+    current = widget
+    for _ in range(16):
+        if not _alive(current):
+            break
+        try:
+            if "assist" in (current.objectName() or "").lower():
+                return True
+            if isinstance(current, (QtWidgets.QDialog, QtWidgets.QDockWidget)):
+                if "assist" in (current.windowTitle() or "").lower():
+                    return True
+            current = current.parentWidget()
+        except Exception:
+            break
+    return False
+
+
 def _make_qt_proxy(mgr):
     if not _init_qt():
         return None
@@ -231,13 +250,13 @@ def _make_qt_proxy(mgr):
             self._t2.timeout.connect(self.on_timer)
 
         @_guard
-        def defer_refresh(self, ms=30):
+        def defer_refresh(self, ms=30, settle_ms=None):
             if not self.owner or not self.owner.initialized:
                 return
             if _alive(self._t1):
                 self._t1.start(ms)
             if _alive(self._t2):
-                self._t2.start(max(ms + 100, 140))
+                self._t2.start(max(ms + 100, 140) if settle_ms is None else max(ms, settle_ms))
 
         @_guard
         def stop_timers(self):
@@ -269,7 +288,8 @@ def _make_qt_proxy(mgr):
         @_guard
         def on_btn_click(self, *_args):
             if self.owner and self.owner.initialized and self.owner.enabled:
-                self.defer_refresh(20)
+                self.owner._patch_dialogs()
+                self.defer_refresh(0, 35)
 
         @_guard
         def on_status_msg(self, msg=""):
@@ -287,7 +307,7 @@ def _make_qt_proxy(mgr):
             if _alive(sender) and isinstance(sender, QtWidgets.QTabBar):
                 self.owner._patch_tabbar(sender)
             self.owner._patch_dialogs()
-            self.defer_refresh(20)
+            self.defer_refresh(0, 35)
 
     return _QtProxy(mgr)
 
@@ -933,8 +953,16 @@ class ZhLocalizer:
             if not _alive(w):
                 continue
 
+            tooltip = w.toolTip() or ""
+            if tooltip and not _has_cjk(tooltip) and _inside_assist(w):
+                zh_tip = self._tr(tooltip)
+                if zh_tip and zh_tip != tooltip:
+                    w.setProperty("_ida_zh_orig_tooltip", tooltip)
+                    w.setToolTip(zh_tip)
+
             if isinstance(w, btn_types):
-                if is_main and isinstance(w, QtWidgets.QToolButton):
+                in_assist = _inside_assist(w)
+                if is_main and isinstance(w, QtWidgets.QToolButton) and not in_assist:
                     continue
                 txt = w.text() or ""
                 if txt and not _has_cjk(txt):
@@ -962,19 +990,43 @@ class ZhLocalizer:
 
             elif isinstance(w, QtWidgets.QLabel):
                 ltxt = w.text() or ""
-                if ltxt and not _has_cjk(ltxt) and len(ltxt) < 400:
-                    if ltxt in self.qt_tr:
+                is_assist = _inside_assist(w)
+                lookup_text = ltxt
+                if is_assist and ltxt.lstrip().startswith("<"):
+                    try:
+                        doc = QtGui.QTextDocument()
+                        doc.setHtml(ltxt)
+                        lookup_text = " ".join(doc.toPlainText().split())
+                    except Exception:
+                        lookup_text = ltxt
+                max_text = 2000 if is_assist else 400
+                if lookup_text and len(lookup_text) < max_text and not _has_cjk(lookup_text):
+                    zh = self.qt_tr.get(lookup_text) or self._tr(lookup_text)
+                    if zh and zh != lookup_text:
                         w.setProperty("_ida_zh_orig_text", ltxt)
-                        w.setText(self.qt_tr[ltxt])
-                    elif not ltxt.lstrip().startswith("<"):
-                        zh = self._tr(ltxt)
-                        if zh and zh != ltxt:
-                            w.setProperty("_ida_zh_orig_text", ltxt)
-                            w.setText(zh)
+                        w.setText(zh)
 
             elif isinstance(w, QtWidgets.QComboBox):
-                if (w.objectName() or "") in SAFE_COMBOS:
+                in_assist = _inside_assist(w)
+                if (w.objectName() or "") in SAFE_COMBOS or in_assist:
                     self._patch_combo(w)
+                    if in_assist and self._proxy is not None and not w.property("_ida_zh_combo_hooked"):
+                        w.setProperty("_ida_zh_combo_hooked", True)
+                        try:
+                            w.currentIndexChanged.connect(self._proxy.on_tab_change)
+                        except Exception:
+                            pass
+
+            elif isinstance(w, QtWidgets.QTextBrowser):
+                self._patch_readonly_text(w)
+
+            elif isinstance(w, QtWidgets.QTextEdit):
+                if w.isReadOnly():
+                    self._patch_readonly_text(w)
+                self._patch_placeholder(w)
+
+            elif isinstance(w, (QtWidgets.QLineEdit, QtWidgets.QPlainTextEdit)):
+                self._patch_placeholder(w)
 
             elif isinstance(w, QtWidgets.QListWidget):
                 if (w.objectName() or "") == "nats":
@@ -1046,6 +1098,30 @@ class ZhLocalizer:
                         pass
 
     @_guard
+    def _patch_readonly_text(self, widget):
+        if not _alive(widget) or not _inside_assist(widget):
+            return
+        text = " ".join((widget.toPlainText() or "").split())
+        if not text or _has_cjk(text):
+            return
+        zh = self._tr(text)
+        if zh and zh != text:
+            widget.setProperty("_ida_zh_orig_html", widget.toHtml())
+            widget.setPlainText(zh)
+
+    @_guard
+    def _patch_placeholder(self, widget):
+        if not _alive(widget) or not hasattr(widget, "placeholderText"):
+            return
+        text = widget.placeholderText() or ""
+        if not text or _has_cjk(text):
+            return
+        zh = self._tr(text)
+        if zh and zh != text:
+            widget.setProperty("_ida_zh_orig_placeholder", text)
+            widget.setPlaceholderText(zh)
+
+    @_guard
     def _patch_statusbar(self, sb, msg=None):
         if not self.enabled or not _alive(sb):
             return
@@ -1076,6 +1152,9 @@ class ZhLocalizer:
         for w in container.findChildren(QtWidgets.QWidget):
             if not _alive(w):
                 continue
+            orig_tip = w.property("_ida_zh_orig_tooltip")
+            if orig_tip:
+                w.setToolTip(str(orig_tip))
             if isinstance(w, txt_widgets):
                 orig = w.property("_ida_zh_orig_text")
                 if orig:
@@ -1084,8 +1163,19 @@ class ZhLocalizer:
                 orig = w.property("_ida_zh_orig_title")
                 if orig:
                     w.setTitle(str(orig))
+            elif isinstance(w, QtWidgets.QTextEdit):
+                orig_html = w.property("_ida_zh_orig_html")
+                if orig_html:
+                    w.setHtml(str(orig_html))
+                orig = w.property("_ida_zh_orig_placeholder")
+                if orig:
+                    w.setPlaceholderText(str(orig))
+            elif isinstance(w, (QtWidgets.QLineEdit, QtWidgets.QPlainTextEdit)):
+                orig = w.property("_ida_zh_orig_placeholder")
+                if orig:
+                    w.setPlaceholderText(str(orig))
             elif isinstance(w, QtWidgets.QComboBox):
-                if (w.objectName() or "") in SAFE_COMBOS:
+                if (w.objectName() or "") in SAFE_COMBOS or _inside_assist(w):
                     self._restore_combo(w)
             elif isinstance(w, QtWidgets.QListWidget):
                 if (w.objectName() or "") == "nats":
@@ -1238,6 +1328,93 @@ class ZhLocalizer:
             zh_b = self.dlg_text_lower.get(base) or self.qt_tr_clean.get(base)
             if zh_b:
                 return _strip_accel(zh_b).rstrip(".") + "..."
+
+        if low.startswith("dismiss: "):
+            target = self._tr(clean[len("Dismiss: "):])
+            if target:
+                return f"关闭：{target}"
+
+        stats = low.split()
+        if (len(stats) == 5 and stats[0].isdigit() and stats[1] in ("msg", "msgs")
+                and stats[2] == "-" and stats[3].isdigit() and stats[4] in ("tool", "tools")):
+            return f"{stats[0]} 条消息 - {stats[3]} 个工具"
+
+        if low.startswith("checked ") and low.endswith(" ago"):
+            elapsed = low[len("checked "):-len(" ago")].split()
+            if len(elapsed) == 2 and elapsed[0].isdigit():
+                unit = {
+                    "minute": "分钟",
+                    "minutes": "分钟",
+                    "hour": "小时",
+                    "hours": "小时",
+                    "second": "秒",
+                    "seconds": "秒",
+                }.get(elapsed[1])
+                if unit:
+                    return f"已检查，{elapsed[0]}{unit}前"
+
+        m = re.fullmatch(r"(?:a|an|(\d+))\s+(second|minute|hour|day|week|month|year)s?\s+ago", low, re.I)
+        if m:
+            unit = {
+                "second": "秒",
+                "minute": "分钟",
+                "hour": "小时",
+                "day": "天",
+                "week": "周",
+                "month": "个月",
+                "year": "年",
+            }[m.group(2).lower()]
+            return f"{m.group(1) or '1'}{unit}前"
+
+        available_at = low.find(" is available.")
+        if low.startswith("assist ") and available_at > len("assist "):
+            version = clean[len("Assist "):available_at]
+            tail = clean[available_at + len(" is available."):].strip()
+            if tail.startswith("Update with `hcli plugin upgrade hexrays/assist`"):
+                return f"Assist {version} 有可用更新。执行 `hcli plugin upgrade hexrays/assist` 更新，然后重启 IDA。"
+            if tail.startswith("Install it with hcli"):
+                return f"Assist {version} 有可用更新。使用 hcli 安装，然后重启 IDA。"
+
+        m = re.fullmatch(r"(\d+)\s+lines?", clean, re.I)
+        if m:
+            return f"{m.group(1)} 行"
+
+        m = re.fullmatch(r"(\d+)\s+renames?\s*[·]\s*(\d+)\s+prototypes?", clean, re.I)
+        if m:
+            return f"重命名 {m.group(1)} 项 · 原型修复 {m.group(2)} 项"
+
+        m = re.fullmatch(r"(\d+)\s+msgs?\s*-\s*(\d+)\s+tools?\s*-\s*~?([\d.]+[kKmM]?)\s*/\s*([\d.]+[kKmM]?)\s+tokens?", clean, re.I)
+        if m:
+            return f"{m.group(1)} 条消息 · {m.group(2)} 次工具调用 · ~{m.group(3)} / {m.group(4)} 个令牌"
+
+        m = re.fullmatch(r"(\d+)\s+calls?\s+(run|refused)", clean, re.I)
+        if m:
+            verb = "已运行" if m.group(2).lower() == "run" else "已拒绝"
+            return f"{m.group(1)} 次调用{verb}"
+
+        m = re.fullmatch(r"(\d+)\s+applied", clean, re.I)
+        if m:
+            return f"已应用 {m.group(1)} 项"
+
+        m = re.fullmatch(r"(\d+)\s+clients?\s*[·]\s*(\d+)\s+allowed\s*[·]\s*(\d+)\s+denied", clean, re.I)
+        if m:
+            return f"客户端 {m.group(1)} · 已允许 {m.group(2)} · 已拒绝 {m.group(3)}"
+
+        m = re.fullmatch(r"(\d+)\s+ok\s*[·]\s*(\d+)\s+failed", clean, re.I)
+        if m:
+            return f"成功 {m.group(1)} · 失败 {m.group(2)}"
+
+        m = re.fullmatch(r"(\d+)\s+message\(s\) waiting to send\. Click to manage, reorder, edit, or interrupt\.?", clean, re.I)
+        if m:
+            return f"{m.group(1)} 条消息等待发送。点击可管理、调整顺序、编辑或中断。"
+
+        m = re.fullmatch(r"Queue is paused\. (\d+) message\(s\) waiting\. Click to manage\.?", clean, re.I)
+        if m:
+            return f"队列已暂停，等待发送：{m.group(1)} 条消息。点击管理。"
+
+        m = re.fullmatch(r"(\d+)\s+message\(s\)\s*-\s*(\d+)\s+tool call\(s\) in this conversation", clean, re.I)
+        if m:
+            return f"此对话包含 {m.group(1)} 条消息 · {m.group(2)} 次工具调用"
         return ""
 
     _lookup_dialog_string = _tr
